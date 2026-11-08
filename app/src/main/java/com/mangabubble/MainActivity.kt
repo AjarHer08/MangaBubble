@@ -21,6 +21,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
@@ -34,6 +35,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var srcSpinner: Spinner
     private lateinit var tgtSpinner: Spinner
+    private lateinit var engineSpinner: Spinner
     private lateinit var autoSwitch: SwitchCompat
     private lateinit var keyEdit: EditText
     private lateinit var modelEdit: EditText
@@ -79,7 +81,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         col.addView(label("Manga Bubble", 26f, 0))
-        col.addView(label("Terjemahkan manga, manhua, dan manhwa langsung di layar.", 14f, 0))
+        col.addView(label("Versi ${Updater.currentName(this)}", 12f, 0))
+        col.addView(label("Terjemahkan manga, manhua, dan manhwa langsung di layar.", 14f, 4))
 
         col.addView(label("Jenis komik (bahasa asli)"))
         srcSpinner = Spinner(this).apply {
@@ -101,6 +104,19 @@ class MainActivity : AppCompatActivity() {
         }
         col.addView(tgtSpinner)
 
+        col.addView(label("Mesin terjemahan"))
+        engineSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity, android.R.layout.simple_spinner_dropdown_item, Config.engines
+            )
+            setSelection(prefs.getInt("engine", 0))
+        }
+        col.addView(engineSpinner)
+        col.addView(label(
+            "Bila mesin pilihan gagal, aplikasi otomatis turun ke mesin berikutnya (Claude, lalu Google, lalu bawaan HP).",
+            12f, 2
+        ))
+
         autoSwitch = SwitchCompat(this).apply {
             text = "Terjemah otomatis saat halaman / chapter berganti"
             isChecked = prefs.getBoolean("auto", true)
@@ -108,7 +124,7 @@ class MainActivity : AppCompatActivity() {
         }
         col.addView(autoSwitch)
 
-        col.addView(label("Terjemahan AI Claude (opsional, jauh lebih akurat)", 14f, 20))
+        col.addView(label("Pengaturan Claude (dipakai bila mesin = Claude)", 14f, 20))
         keyEdit = EditText(this).apply {
             hint = "API key Anthropic (sk-ant-...)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -123,8 +139,8 @@ class MainActivity : AppCompatActivity() {
         }
         col.addView(modelEdit)
         col.addView(label(
-            "Kosongkan API key untuk memakai terjemahan bawaan (offline, kurang akurat). " +
-                "Bila diisi, tangkapan layar dikirim ke Anthropic untuk diterjemahkan; key hanya disimpan di HP ini.",
+            "Dengan Claude, tangkapan layar dikirim ke Anthropic dan biaya dihitung dari API key Anda; key hanya disimpan di HP ini. " +
+                "Dengan Google, hanya teks hasil OCR yang dikirim. Model claude-haiku-5-5 lebih murah dan cepat, tapi kurang teliti.",
             12f, 4
         ))
 
@@ -136,12 +152,20 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(24) })
 
+        val updateBtn = Button(this).apply {
+            text = "Cek pembaruan"
+            setOnClickListener { checkUpdate(silent = false) }
+        }
+        col.addView(updateBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
         status = label("", 14f, 8)
         col.addView(status)
 
         col.addView(label(
             "Cara pakai:\n" +
-                "1. Pilih jenis komik dan bahasa tujuan, lalu ketuk Mulai bubble.\n" +
+                "1. Pilih jenis komik, bahasa tujuan, dan mesin terjemahan, lalu ketuk Mulai bubble.\n" +
                 "2. Izinkan tampil di atas aplikasi lain dan tangkap layar. Pada Android 14 ke atas, " +
                 "pilih \"Seluruh layar\" atau aplikasi pembaca komik Anda.\n" +
                 "3. Mode otomatis: terjemahan muncul sendiri begitu halaman berhenti bergerak, dan hilang saat Anda scroll atau pindah chapter.\n" +
@@ -164,7 +188,52 @@ class MainActivity : AppCompatActivity() {
             v.setPadding(dp(20) + b.left, dp(20) + b.top, dp(20) + b.right, dp(20) + b.bottom)
             insets
         }
+
+        checkUpdate(silent = true)
     }
+
+    // ---------- Cek pembaruan ----------
+
+    private fun checkUpdate(silent: Boolean) {
+        if (!silent) status.text = "Memeriksa pembaruan…"
+        Thread {
+            try {
+                val info = Updater.latest()
+                val cur = Updater.currentVersion(this)
+                runOnUiThread {
+                    if (isFinishing) return@runOnUiThread
+                    when {
+                        info == null -> if (!silent) status.text = "Belum ada rilis di GitHub."
+                        info.version > cur -> {
+                            status.text = "Versi baru tersedia: ${info.tag}"
+                            showUpdateDialog(info)
+                        }
+                        else -> if (!silent) status.text = "Sudah versi terbaru (${Updater.currentName(this)})."
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    if (!silent) status.text = "Gagal memeriksa pembaruan: ${e.message}"
+                }
+            }
+        }.start()
+    }
+
+    private fun showUpdateDialog(info: Updater.Info) {
+        AlertDialog.Builder(this)
+            .setTitle("Pembaruan tersedia")
+            .setMessage(
+                "Versi ${info.tag} sudah tersedia (terpasang ${Updater.currentName(this)}). " +
+                    "Setelah APK terunduh, buka file-nya untuk memasang."
+            )
+            .setPositiveButton("Unduh") { _, _ ->
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(info.url)))
+            }
+            .setNegativeButton("Nanti", null)
+            .show()
+    }
+
+    // ---------- Mulai ----------
 
     private fun onStartClicked() {
         val src = Config.sources[srcSpinner.selectedItemPosition].second
@@ -183,6 +252,7 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences(Config.PREFS, Context.MODE_PRIVATE).edit()
             .putInt("src", srcSpinner.selectedItemPosition)
             .putInt("tgt", tgtSpinner.selectedItemPosition)
+            .putInt("engine", engineSpinner.selectedItemPosition)
             .putBoolean("auto", autoSwitch.isChecked)
             .putString("apikey", keyEdit.text.toString().trim())
             .putString("model", modelEdit.text.toString().trim())
@@ -190,7 +260,7 @@ class MainActivity : AppCompatActivity() {
         downloadModels(src, tgt)
     }
 
-    /** Model terjemahan bawaan diunduh sekali (butuh internet), setelah itu bisa offline. */
+    /** Model terjemahan bawaan diunduh sekali (butuh internet), setelah itu bisa offline. Dipakai sebagai cadangan. */
     private fun downloadModels(src: String, tgt: String) {
         status.text = "Menyiapkan model terjemahan (sekali saja, butuh internet)…"
         startBtn.isEnabled = false

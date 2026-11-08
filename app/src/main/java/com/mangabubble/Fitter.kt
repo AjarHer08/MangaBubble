@@ -73,8 +73,11 @@ object Fitter {
             var px = maxPx
             while (px >= minPx) {
                 paint.textSize = px
-                val l = layout(text, paint, inner)
-                if (l.height <= h - 2 * pad) return place(l, w, h, cx, cy, pad, bg, sw, sh)
+                // Kata tidak boleh terpotong di tengah ("ha-nya"): bila kata terpanjang tidak muat, kecilkan huruf atau lebarkan kotak.
+                if (longestWord(text, paint) <= inner) {
+                    val l = layout(text, paint, inner)
+                    if (l.height <= h - 2 * pad) return place(l, w, h, cx, cy, pad, bg, sw, sh)
+                }
                 px -= 0.5f * dens
             }
         }
@@ -83,6 +86,12 @@ object Fitter {
         val w = minOf(r.width() * 2.4f, maxW)
         val l = layout(text, paint, (w - 2 * pad).toInt().coerceAtLeast(24))
         return place(l, w, l.height + 2 * pad, cx, cy, pad, bg, sw, sh)
+    }
+
+    private fun longestWord(text: String, paint: TextPaint): Float {
+        var m = 0f
+        for (w in text.split(Regex("\\s+"))) m = maxOf(m, paint.measureText(w))
+        return m
     }
 
     private fun place(

@@ -82,6 +82,7 @@ class FloatingService : Service() {
 
     // Pengaturan dari layar utama
     private var auto = true
+    private var engine = 0 // 0 Claude, 1 Google, 2 bawaan HP
     private var apiKey = ""
     private var model = Config.DEFAULT_MODEL
 
@@ -144,6 +145,7 @@ class FloatingService : Service() {
         tgt = intent.getStringExtra(EXTRA_TGT) ?: "id"
         val prefs = getSharedPreferences(Config.PREFS, MODE_PRIVATE)
         auto = prefs.getBoolean("auto", true)
+        engine = prefs.getInt("engine", 0)
         apiKey = prefs.getString("apikey", "")?.trim().orEmpty()
         model = prefs.getString("model", "")?.trim().orEmpty().ifEmpty { Config.DEFAULT_MODEL }
 
@@ -473,19 +475,34 @@ class FloatingService : Service() {
                 val cy = l.r.centerY()
                 cy > topBar && cy < sh - botBar && !urlLike.containsMatchIn(l.text)
             }
-            var pairs: List<Pair<Rect, String>>? = null
-            if (apiKey.isNotEmpty() && found.isNotEmpty()) {
-                try {
-                    pairs = Claude.translate(apiKey, model, bmp, found, src, tgt).mapNotNull { g ->
-                        val ls = g.ids.map { found[it] }
-                        // Teks yang hasilnya sama dengan aslinya tidak perlu ditimpa.
-                        if (same(Ocr.join(ls, src), g.text)) null else Ocr.union(ls) to g.text
-                    }
-                } catch (e: Exception) {
-                    note = "AI gagal (${e.message}), memakai terjemahan bawaan"
+            // Coba mesin pilihan dulu; bila gagal, turun ke mesin berikutnya (Claude -> Google -> bawaan HP).
+            var translated: List<Pair<Rect, String>> = emptyList()
+            if (found.isNotEmpty()) {
+                val order = when (engine) {
+                    0 -> listOf(0, 1, 2)
+                    1 -> listOf(1, 2)
+                    else -> listOf(2)
                 }
+                var done = false
+                for (e in order) {
+                    if (e == 0 && apiKey.isEmpty()) {
+                        note = "API key Claude kosong, memakai mesin lain"
+                        continue
+                    }
+                    try {
+                        translated = when (e) {
+                            0 -> viaClaude(bmp, found)
+                            1 -> viaGoogle(found)
+                            else -> offlineTranslate(found)
+                        }
+                        done = true
+                        break
+                    } catch (ex: Exception) {
+                        note = "${engineName(e)} gagal (${ex.message}), mencoba mesin lain"
+                    }
+                }
+                if (!done) throw Exception(note ?: "semua mesin terjemahan gagal")
             }
-            val translated = pairs ?: offlineTranslate(found)
 
             val items = translated.map { (rect, tl) ->
                 val r = Rect(rect)
@@ -506,6 +523,34 @@ class FloatingService : Service() {
             }
         } finally {
             bmp.recycle()
+        }
+    }
+
+    private fun engineName(e: Int) = when (e) {
+        0 -> "Claude"
+        1 -> "Google"
+        else -> "Bawaan HP"
+    }
+
+    private fun viaClaude(bmp: Bitmap, found: List<Ocr.Ln>): List<Pair<Rect, String>> =
+        Claude.translate(apiKey, model, bmp, found, src, tgt).mapNotNull { g ->
+            val ls = g.ids.map { found[it] }
+            // Teks yang hasilnya sama dengan aslinya tidak perlu ditimpa.
+            if (same(Ocr.join(ls, src), g.text)) null else Ocr.union(ls) to g.text
+        }
+
+    /** Google Translate: kelompokkan baris per balon, lewati efek suara, terjemahkan tiap balon. */
+    private fun viaGoogle(lines: List<Ocr.Ln>): List<Pair<Rect, String>> {
+        val med = Ocr.medianThickness(lines)
+        val groups = Ocr.cluster(lines)
+            .filter { !Ocr.isSfx(it, med) }
+            .map { it to Ocr.join(it, src) }
+            .filter { (_, t) -> t.count { c -> c.isLetterOrDigit() } >= 2 }
+        val texts = groups.map { it.second }
+        val tr = Google.translateAll(texts, src, tgt)
+        return groups.indices.mapNotNull { i ->
+            val t = tr[i].trim()
+            if (t.isEmpty() || same(texts[i], t)) null else Ocr.union(groups[i].first) to t
         }
     }
 

@@ -3,6 +3,9 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Di GitHub Actions nomor run dipakai sebagai nomor versi (sama dengan tag rilis v1.0.N).
+val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+
 android {
     namespace = "com.mangabubble"
     compileSdk = 35
@@ -11,8 +14,19 @@ android {
         applicationId = "com.mangabubble"
         minSdk = 23          // Android 6
         targetSdk = 35       // berjalan juga di Android 16/17 lewat kompatibilitas
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = maxOf(runNumber, 1)
+        versionName = "1.0.$runNumber"
+    }
+
+    // Kunci debug tetap, supaya APK dari tiap build bisa menimpa versi lama tanpa uninstall.
+    // (Kunci ini sengaja publik dan hanya untuk pemakaian pribadi.)
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
