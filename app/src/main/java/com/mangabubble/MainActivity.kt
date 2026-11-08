@@ -10,9 +10,11 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -20,6 +22,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -31,6 +34,9 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var srcSpinner: Spinner
     private lateinit var tgtSpinner: Spinner
+    private lateinit var autoSwitch: SwitchCompat
+    private lateinit var keyEdit: EditText
+    private lateinit var modelEdit: EditText
     private lateinit var status: TextView
     private lateinit var startBtn: Button
 
@@ -44,7 +50,7 @@ class MainActivity : AppCompatActivity() {
                     .putExtra(FloatingService.EXTRA_SRC, Config.sources[srcSpinner.selectedItemPosition].second)
                     .putExtra(FloatingService.EXTRA_TGT, Config.targets[tgtSpinner.selectedItemPosition].second)
                 ContextCompat.startForegroundService(this, i)
-                status.text = "Bubble aktif. Buka komik, lalu ketuk bubble biru."
+                status.text = "Bubble aktif. Buka komik, bubble biru akan menerjemahkan."
                 moveTaskToBack(true)
             } else {
                 status.text = "Izin tangkap layar ditolak."
@@ -95,6 +101,33 @@ class MainActivity : AppCompatActivity() {
         }
         col.addView(tgtSpinner)
 
+        autoSwitch = SwitchCompat(this).apply {
+            text = "Terjemah otomatis saat halaman / chapter berganti"
+            isChecked = prefs.getBoolean("auto", true)
+            setPadding(0, dp(16), 0, dp(4))
+        }
+        col.addView(autoSwitch)
+
+        col.addView(label("Terjemahan AI Claude (opsional, jauh lebih akurat)", 14f, 20))
+        keyEdit = EditText(this).apply {
+            hint = "API key Anthropic (sk-ant-...)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setSingleLine()
+            setText(prefs.getString("apikey", ""))
+        }
+        col.addView(keyEdit)
+        modelEdit = EditText(this).apply {
+            hint = Config.DEFAULT_MODEL
+            setSingleLine()
+            setText(prefs.getString("model", Config.DEFAULT_MODEL))
+        }
+        col.addView(modelEdit)
+        col.addView(label(
+            "Kosongkan API key untuk memakai terjemahan bawaan (offline, kurang akurat). " +
+                "Bila diisi, tangkapan layar dikirim ke Anthropic untuk diterjemahkan; key hanya disimpan di HP ini.",
+            12f, 4
+        ))
+
         startBtn = Button(this).apply {
             text = "Mulai bubble"
             setOnClickListener { onStartClicked() }
@@ -111,8 +144,10 @@ class MainActivity : AppCompatActivity() {
                 "1. Pilih jenis komik dan bahasa tujuan, lalu ketuk Mulai bubble.\n" +
                 "2. Izinkan tampil di atas aplikasi lain dan tangkap layar. Pada Android 14 ke atas, " +
                 "pilih \"Seluruh layar\" atau aplikasi pembaca komik Anda.\n" +
-                "3. Buka halaman komik, ketuk bubble biru: teks terjemahan menimpa teks asli.\n" +
-                "4. Ketuk di mana saja untuk menutup hasil. Seret bubble untuk memindah, tahan 1 detik untuk menutup bubble.\n\n" +
+                "3. Mode otomatis: terjemahan muncul sendiri begitu halaman berhenti bergerak, dan hilang saat Anda scroll atau pindah chapter.\n" +
+                "4. Ketuk bubble untuk menerjemahkan sekarang, atau melihat teks asli saat terjemahan tampil. " +
+                "Seret untuk memindah, tahan 1 detik untuk mematikan.\n" +
+                "5. Mode manual (otomatis dimatikan): ketuk bubble, lalu ketuk layar untuk menutup hasil.\n\n" +
                 "Tips akurasi: perbesar halaman agar huruf cukup besar, dan pastikan jenis komik sesuai bahasa aslinya.",
             13f, 20
         ))
@@ -148,11 +183,14 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences(Config.PREFS, Context.MODE_PRIVATE).edit()
             .putInt("src", srcSpinner.selectedItemPosition)
             .putInt("tgt", tgtSpinner.selectedItemPosition)
+            .putBoolean("auto", autoSwitch.isChecked)
+            .putString("apikey", keyEdit.text.toString().trim())
+            .putString("model", modelEdit.text.toString().trim())
             .apply()
         downloadModels(src, tgt)
     }
 
-    /** Model terjemahan diunduh sekali (butuh internet), setelah itu bisa offline. */
+    /** Model terjemahan bawaan diunduh sekali (butuh internet), setelah itu bisa offline. */
     private fun downloadModels(src: String, tgt: String) {
         status.text = "Menyiapkan model terjemahan (sekali saja, butuh internet)…"
         startBtn.isEnabled = false

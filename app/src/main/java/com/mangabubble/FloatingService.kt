@@ -11,6 +11,7 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -21,6 +22,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.View
@@ -38,6 +40,7 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognizer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 class FloatingService : Service() {
 
@@ -49,6 +52,9 @@ class FloatingService : Service() {
         const val ACTION_STOP = "com.mangabubble.STOP"
         private const val CHANNEL = "mb"
         private const val NOTIF_ID = 1
+        private const val THRESH = 4f          // selisih rata-rata sidik jari layar yang dianggap "berubah"
+        private const val STABLE_MS = 900L     // layar harus diam sekian ms sebelum terjemah otomatis
+        private const val TICK_MS = 500L
     }
 
     private lateinit var wm: WindowManager
@@ -67,7 +73,27 @@ class FloatingService : Service() {
     private var recognizer: TextRecognizer? = null
     private var translator: Translator? = null
     private var src = "ja"
+    private var tgt = "id"
     private var busy = false
+
+    // Pengaturan dari layar utama
+    private var auto = true
+    private var apiKey = ""
+    private var model = Config.DEFAULT_MODEL
+
+    // Status mode otomatis
+    private var lastFp: ByteArray? = null
+    private var captureFp: ByteArray? = null
+    private var lastChangeAt = 0L
+    private var suppressUntil = 0L
+    private var translatedStable = false
+    private var paused = false
+    private val ticker = object : Runnable {
+        override fun run() {
+            tick()
+            main.postDelayed(this, TICK_MS)
+        }
+    }
 
     private val projCb = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -103,7 +129,11 @@ class FloatingService : Service() {
 
         teardown()
         src = intent.getStringExtra(EXTRA_SRC) ?: "ja"
-        val tgt = intent.getStringExtra(EXTRA_TGT) ?: "id"
+        tgt = intent.getStringExtra(EXTRA_TGT) ?: "id"
+        val prefs = getSharedPreferences(Config.PREFS, MODE_PRIVATE)
+        auto = prefs.getBoolean("auto", true)
+        apiKey = prefs.getString("apikey", "")?.trim().orEmpty()
+        model = prefs.getString("model", "")?.trim().orEmpty().ifEmpty { Config.DEFAULT_MODEL }
 
         try {
             val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -121,6 +151,11 @@ class FloatingService : Service() {
                 TranslatorOptions.Builder().setSourceLanguage(src).setTargetLanguage(tgt).build()
             )
             showBubble()
+            if (auto) {
+                lastChangeAt = SystemClock.uptimeMillis()
+                translatedStable = false
+                main.postDelayed(ticker, 700)
+            }
         } catch (e: Exception) {
             toast("Gagal memulai: ${e.message}")
             stopSelf()
@@ -168,7 +203,7 @@ class FloatingService : Service() {
         dpi = resources.displayMetrics.densityDpi
         val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         reader = r
-        // Android 14+ hanya mengizinkan satu VirtualDisplay per proyeksi, jadi dipakai terus dan diambil framenya saat diketuk.
+        // Android 14+ hanya mengizinkan satu VirtualDisplay per proyeksi, jadi dipakai terus dan diambil framenya saat perlu.
         display = p.createVirtualDisplay(
             "MangaBubble", w, h, dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, main
@@ -181,13 +216,16 @@ class FloatingService : Service() {
         val (w, h) = realSize()
         if (w == capW && h == capH) return
         try {
-            dismissResult()
+            removeResultView()
             val nr = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
             d.resize(w, h, dpi)
             d.surface = nr.surface
             reader?.close()
             reader = nr
             capW = w; capH = h
+            lastFp = null
+            translatedStable = false
+            lastChangeAt = SystemClock.uptimeMillis()
         } catch (e: Exception) {
             toast("Rotasi layar gagal: ${e.message}")
         }
@@ -203,6 +241,76 @@ class FloatingService : Service() {
         val cropped = Bitmap.createBitmap(full, 0, 0, img.width, img.height)
         full.recycle()
         return cropped
+    }
+
+    // ---------- Deteksi perubahan layar (mode otomatis) ----------
+
+    /** Sidik jari layar: kecerahan di kisi 24x48 titik. Murah dihitung, cukup untuk mendeteksi scroll / ganti halaman. */
+    private fun fingerprint(img: Image): ByteArray {
+        val plane = img.planes[0]
+        val buf = plane.buffer
+        val ps = plane.pixelStride
+        val rs = plane.rowStride
+        val w = img.width
+        val h = img.height
+        val gx = 24
+        val gy = 48
+        val out = ByteArray(gx * gy)
+        for (j in 0 until gy) for (i in 0 until gx) {
+            val x = i * w / gx + w / (2 * gx)
+            val y = j * h / gy + h / (2 * gy)
+            val o = y * rs + x * ps
+            val r = buf.get(o).toInt() and 0xFF
+            val g = buf.get(o + 1).toInt() and 0xFF
+            val b = buf.get(o + 2).toInt() and 0xFF
+            out[j * gx + i] = ((r * 30 + g * 59 + b * 11) / 100).toByte()
+        }
+        return out
+    }
+
+    private fun diff(a: ByteArray, b: ByteArray): Float {
+        if (a.size != b.size) return 255f
+        var s = 0L
+        for (i in a.indices) s += abs((a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF))
+        return s.toFloat() / a.size
+    }
+
+    private fun tick() {
+        if (!auto || busy) return
+        val img = try {
+            reader?.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        }
+        // Tidak ada frame baru berarti layar diam.
+        val fp = if (img != null) {
+            try {
+                fingerprint(img)
+            } finally {
+                img.close()
+            }
+        } else lastFp ?: return
+
+        val now = SystemClock.uptimeMillis()
+        val prev = lastFp
+        lastFp = fp
+        if (now < suppressUntil || prev == null) return
+
+        if (diff(prev, fp) > THRESH) {
+            // Layar bergerak (scroll / halaman atau chapter baru): buang terjemahan lama.
+            lastChangeAt = now
+            translatedStable = false
+            paused = false
+            if (result != null) {
+                removeResultView()
+                suppressUntil = now + 400 // abaikan perubahan akibat overlay yang kita lepas sendiri
+            }
+            return
+        }
+        if (!translatedStable && !paused && now - lastChangeAt >= STABLE_MS) {
+            translatedStable = true
+            startTranslate()
+        }
     }
 
     // ---------- Bubble ----------
@@ -223,16 +331,31 @@ class FloatingService : Service() {
             x = (8 * d).toInt()
             y = capH / 3
         }
-        val v = BubbleView(this, wm, lp, onTap = { startTranslate() }, onLong = { stopSelf() })
+        val v = BubbleView(this, wm, lp, onTap = { onBubbleTap() }, onLong = { stopSelf() })
         wm.addView(v, lp)
         bubble = v
+    }
+
+    private fun onBubbleTap() {
+        if (busy) return
+        if (result != null) {
+            // Mode otomatis: ketuk saat terjemahan tampil = intip teks asli. Ketuk lagi untuk menerjemahkan.
+            removeResultView()
+            paused = true
+            suppressUntil = SystemClock.uptimeMillis() + 500
+            return
+        }
+        paused = false
+        translatedStable = true
+        startTranslate()
     }
 
     private fun startTranslate() {
         if (busy) return
         busy = true
+        removeResultView()
         bubble?.visibility = View.INVISIBLE // sembunyikan agar tidak ikut terbaca OCR
-        main.postDelayed({ grab(0) }, 250)
+        main.postDelayed({ grab(0) }, 300)
     }
 
     private fun grab(attempt: Int) {
@@ -244,12 +367,13 @@ class FloatingService : Service() {
         if (img == null) {
             if (attempt < 8) main.postDelayed({ grab(attempt + 1) }, 120)
             else {
-                toast("Gagal menangkap layar, coba lagi")
+                if (!auto) toast("Gagal menangkap layar, coba lagi")
                 finishBusy()
             }
             return
         }
         val bmp = try {
+            captureFp = fingerprint(img)
             toBitmap(img)
         } finally {
             img.close()
@@ -264,32 +388,54 @@ class FloatingService : Service() {
     // ---------- OCR + terjemahan ----------
 
     private fun process(bmp: Bitmap) {
+        var note: String? = null
         try {
             val rec = recognizer ?: return
-            val tr = translator ?: return
             val dens = resources.displayMetrics.density
             val sw = bmp.width
             val sh = bmp.height
 
-            Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
-            val text = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)))
+            var lines = Ocr.collect(Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0))))
 
-            val groups = Ocr.cluster(Ocr.collect(text))
-            val items = ArrayList<Fitter.Drawn>()
-            for (g in groups) {
-                val joined = Ocr.join(g, src)
-                if (joined.count { it.isLetterOrDigit() } < 2) continue
-                val translated = Tasks.await(tr.translate(joined)).trim()
-                if (translated.isEmpty()) continue
-
-                val rect = Ocr.union(g)
-                val m = (3 * dens).toInt()
-                rect.inset(-m, -m)
-                val bg = Fitter.sampleBackground(bmp, rect)
-                val fg = if (Fitter.luminance(bg) > 140f) Color.BLACK else Color.WHITE
-                items.add(Fitter.fit(translated, rect, bg, fg, dens, sw, sh))
+            // Huruf kecil dibaca lebih akurat bila gambar diperbesar.
+            if (lines.isNotEmpty() && Ocr.medianThickness(lines) < 26) {
+                try {
+                    val big = Bitmap.createScaledBitmap(bmp, (sw * 1.5f).toInt(), (sh * 1.5f).toInt(), true)
+                    try {
+                        val l2 = Ocr.collect(Tasks.await(rec.process(InputImage.fromBitmap(big, 0))), 1.5f)
+                        if (l2.isNotEmpty()) lines = l2
+                    } finally {
+                        big.recycle()
+                    }
+                } catch (_: OutOfMemoryError) {
+                }
             }
-            main.post { showResult(items) }
+
+            val found = lines
+            var pairs: List<Pair<Rect, String>>? = null
+            if (apiKey.isNotEmpty() && found.isNotEmpty()) {
+                try {
+                    pairs = Claude.translate(apiKey, model, bmp, found, src, tgt).map { g ->
+                        Ocr.union(g.ids.map { found[it] }) to g.text
+                    }
+                } catch (e: Exception) {
+                    note = "AI gagal (${e.message}), memakai terjemahan bawaan"
+                }
+            }
+            val translated = pairs ?: offlineTranslate(found)
+
+            val items = translated.map { (rect, tl) ->
+                val r = Rect(rect)
+                val m = (3 * dens).toInt()
+                r.inset(-m, -m)
+                val bg = Fitter.sampleBackground(bmp, r)
+                val fg = if (Fitter.luminance(bg) > 140f) Color.BLACK else Color.WHITE
+                Fitter.fit(tl, r, bg, fg, dens, sw, sh)
+            }
+            main.post {
+                note?.let { toast(it) }
+                showResult(items)
+            }
         } catch (e: Exception) {
             main.post {
                 toast("Gagal menerjemahkan: ${e.message}")
@@ -300,34 +446,85 @@ class FloatingService : Service() {
         }
     }
 
+    /** Cadangan tanpa AI: kelompokkan baris, lewati efek suara, terjemahkan dengan ML Kit. */
+    private fun offlineTranslate(lines: List<Ocr.Ln>): List<Pair<Rect, String>> {
+        val tr = translator ?: return emptyList()
+        Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
+        val med = Ocr.medianThickness(lines)
+        val out = ArrayList<Pair<Rect, String>>()
+        for (g in Ocr.cluster(lines)) {
+            if (Ocr.isSfx(g, med)) continue
+            val joined = Ocr.join(g, src)
+            if (joined.count { it.isLetterOrDigit() } < 2) continue
+            val t = Tasks.await(tr.translate(joined)).trim()
+            if (t.isNotEmpty()) out.add(Ocr.union(g) to t)
+        }
+        return out
+    }
+
+    /** Bandingkan layar sekarang dengan saat ditangkap: bila sudah bergeser, hasil lama tidak dipasang. */
+    private fun screenChangedSinceCapture(): Boolean {
+        val cap = captureFp ?: return false
+        val img = try {
+            reader?.acquireLatestImage()
+        } catch (e: Exception) {
+            null
+        } ?: return false
+        val fp = try {
+            fingerprint(img)
+        } finally {
+            img.close()
+        }
+        return diff(cap, fp) > THRESH
+    }
+
     private fun showResult(items: List<Fitter.Drawn>) {
         bubble?.loading = false
+        if (screenChangedSinceCapture()) {
+            translatedStable = false
+            lastChangeAt = SystemClock.uptimeMillis()
+            if (!auto) toast("Halaman berubah, ketuk bubble lagi")
+            finishBusy()
+            suppressUntil = 0
+            return
+        }
         if (items.isEmpty()) {
-            toast("Teks tidak ditemukan. Perbesar halaman atau cek jenis komik.")
+            if (!auto) toast("Teks tidak ditemukan. Perbesar halaman atau cek jenis komik.")
             finishBusy()
             return
         }
-        bubble?.visibility = View.INVISIBLE
-        val lp = WindowManager.LayoutParams(
-            capW, capH, overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
+        val touchable = !auto
+        var f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        if (!touchable) f = f or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        val lp = WindowManager.LayoutParams(capW, capH, overlayType(), f, PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.TOP or Gravity.START
             if (Build.VERSION.SDK_INT >= 28) {
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
+            // Android 12+ memblokir sentuhan yang menembus overlay yang lebih buram dari 80%.
+            if (!touchable && Build.VERSION.SDK_INT >= 31) alpha = 0.8f
         }
-        val v = ResultView(this, items) { dismissResult() }
+        val v = ResultView(this, items, touchable) { dismissResult() }
         wm.addView(v, lp)
         result = v
+        suppressUntil = SystemClock.uptimeMillis() + 800
+        if (auto) {
+            busy = false // terus memantau layar saat terjemahan tampil
+            bubble?.visibility = View.VISIBLE
+        } else {
+            bubble?.visibility = View.INVISIBLE
+        }
+    }
+
+    private fun removeResultView() {
+        result?.let { runCatching { wm.removeView(it) } }
+        result = null
     }
 
     private fun dismissResult() {
-        result?.let { runCatching { wm.removeView(it) } }
-        result = null
+        removeResultView()
         bubble?.visibility = View.VISIBLE
         busy = false
     }
@@ -338,6 +535,7 @@ class FloatingService : Service() {
             visibility = View.VISIBLE
         }
         busy = false
+        suppressUntil = SystemClock.uptimeMillis() + 600
     }
 
     private fun toast(msg: String) {
@@ -347,7 +545,11 @@ class FloatingService : Service() {
     // ---------- Bersih-bersih ----------
 
     private fun teardown() {
-        dismissResult()
+        main.removeCallbacks(ticker)
+        removeResultView()
+        busy = false
+        lastFp = null
+        captureFp = null
         bubble?.let { runCatching { wm.removeView(it) } }
         bubble = null
         runCatching { display?.release() }

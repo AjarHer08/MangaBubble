@@ -57,6 +57,8 @@ object Fitter {
         val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             color = fg
             typeface = Typeface.DEFAULT_BOLD
+            // Bayangan lembut di bawah huruf.
+            setShadowLayer(2.5f * dens, 0f, 1.2f * dens, 0x66000000)
         }
         val maxPx = 24 * dens
         val minPx = 9 * dens

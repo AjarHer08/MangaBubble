@@ -8,6 +8,7 @@ import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlin.math.abs
 
 object Ocr {
 
@@ -20,25 +21,34 @@ object Ocr {
         else -> TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }
 
-    /** Ambil semua baris teks hasil OCR, buang yang keyakinannya rendah (noise gambar / SFX). */
-    fun collect(t: Text): List<Ln> {
+    /**
+     * Ambil semua baris teks hasil OCR dan buang yang keyakinannya rendah.
+     * [scale] > 1 dipakai bila OCR dijalankan pada gambar yang diperbesar; koordinat dikembalikan ke ukuran layar asli.
+     */
+    fun collect(t: Text, scale: Float = 1f): List<Ln> {
         val all = t.textBlocks.flatMap { it.lines }
         val hasConf = all.any { it.confidence > 0f }
         return all.mapNotNull { l ->
-            val r = l.boundingBox ?: return@mapNotNull null
+            val b = l.boundingBox ?: return@mapNotNull null
             if (hasConf && l.confidence < 0.35f) return@mapNotNull null
             val s = l.text.trim()
             if (s.isEmpty()) return@mapNotNull null
+            val r = if (scale == 1f) Rect(b) else Rect(
+                (b.left / scale).toInt(), (b.top / scale).toInt(),
+                (b.right / scale).toInt(), (b.bottom / scale).toInt()
+            )
             Ln(s, r, r.height() > r.width() * 1.2f)
         }
     }
 
-    private fun thick(a: Ln) = if (a.vertical) a.r.width() else a.r.height()
+    fun thick(a: Ln) = if (a.vertical) a.r.width() else a.r.height()
+
+    fun medianThickness(l: List<Ln>): Int =
+        if (l.isEmpty()) 0 else l.map { thick(it) }.sorted()[l.size / 2]
 
     /**
-     * Kelompokkan baris yang berdekatan menjadi satu balon bicara.
-     * Baris bertumpuk harus saling beririsan pada sumbu baca, sehingga dua balon
-     * yang bersebelahan tidak ikut tergabung.
+     * Kelompokkan baris menjadi balon bicara (cadangan bila mode AI tidak dipakai).
+     * Syarat gabung: arah sama, tinggi huruf mirip, jarak rapat, dan rata (kiri/tengah/kanan) pada baris bertumpuk.
      */
     fun cluster(l: List<Ln>): List<List<Ln>> {
         val p = IntArray(l.size) { it }
@@ -54,15 +64,36 @@ object Ocr {
             val a = l[i]
             val b = l[j]
             if (a.vertical != b.vertical) continue
-            val gap = minOf(thick(a), thick(b)) * 0.9f
+            val ta = thick(a).toFloat()
+            val tb = thick(b).toFloat()
+            val t = minOf(ta, tb)
+            if (t <= 0f || maxOf(ta, tb) / t > 1.45f) continue
+            val gap = t * 0.6f
             val dx = maxOf(0, maxOf(a.r.left, b.r.left) - minOf(a.r.right, b.r.right))
             val dy = maxOf(0, maxOf(a.r.top, b.r.top) - minOf(a.r.bottom, b.r.bottom))
             val along = if (a.vertical) dy else dx
             val across = if (a.vertical) dx else dy
-            val near = (along == 0 && across <= gap) || (across == 0 && along <= gap * 0.6f)
-            if (near) p[find(i)] = find(j)
+            val tol = t * 0.8f
+            val aligned = if (a.vertical) {
+                abs(a.r.top - b.r.top) <= tol || abs(a.r.centerY() - b.r.centerY()) <= tol ||
+                    abs(a.r.bottom - b.r.bottom) <= tol
+            } else {
+                abs(a.r.left - b.r.left) <= tol || abs(a.r.centerX() - b.r.centerX()) <= tol ||
+                    abs(a.r.right - b.r.right) <= tol
+            }
+            val stacked = along == 0 && across <= gap && aligned
+            val sameRow = across == 0 && along <= gap * 0.6f
+            if (stacked || sameRow) p[find(i)] = find(j)
         }
         return l.indices.groupBy { find(it) }.values.map { idx -> idx.map { l[it] } }
+    }
+
+    /** Efek suara biasanya berhuruf jauh lebih besar dari dialog dan singkat: dilewati. */
+    fun isSfx(g: List<Ln>, median: Int): Boolean {
+        if (median <= 0) return false
+        val t = g.maxOf { thick(it) }
+        val letters = g.sumOf { l -> l.text.count { it.isLetterOrDigit() } }
+        return t >= median * 2.4f && letters <= 14
     }
 
     /** Susun baris sesuai arah baca (vertikal: kolom kanan ke kiri) lalu gabungkan jadi satu kalimat. */

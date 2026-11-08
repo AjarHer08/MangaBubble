@@ -2,6 +2,7 @@ package com.mangabubble
 
 object Config {
     const val PREFS = "cfg"
+    const val DEFAULT_MODEL = "claude-haiku-5-5"
 
     // (label, kode bahasa ML Kit)
     val sources = listOf(

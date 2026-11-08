@@ -1,9 +1,11 @@
 package com.mangabubble
 
 import android.content.Context
+import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.View
@@ -95,25 +97,48 @@ class BubbleView(
     }
 }
 
-/** Lapisan layar penuh yang menggambar terjemahan tepat di atas teks asli. Ketuk di mana saja untuk menutup. */
+/**
+ * Lapisan layar penuh yang menggambar terjemahan tepat di atas teks asli.
+ * Latar tiap teks bertepi lembut seperti asap (bukan kotak tajam) dan hurufnya diberi bayangan.
+ * Bila [touchable] false (mode otomatis), sentuhan diteruskan ke aplikasi di bawahnya sehingga bisa scroll.
+ */
 class ResultView(
     ctx: Context,
     private val items: List<Fitter.Drawn>,
+    private val touchable: Boolean,
     private val onClose: () -> Unit
 ) : View(ctx) {
 
-    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val dens = ctx.resources.displayMetrics.density
+    private val blur = 8f * dens
+    private val halo = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        maskFilter = BlurMaskFilter(blur, BlurMaskFilter.Blur.NORMAL)
+    }
+    private val solid = Paint(Paint.ANTI_ALIAS_FLAG)
     private val loc = IntArray(2)
-    private val radius = 10f * ctx.resources.displayMetrics.density
+    private val rr = RectF()
+
+    init {
+        setLayerType(LAYER_TYPE_SOFTWARE, null) // BlurMaskFilter butuh software layer di Android lama
+    }
 
     override fun onDraw(c: Canvas) {
         // Koordinat hasil OCR berpatokan pada layar penuh; koreksi bila jendela bergeser (status bar, poni).
         getLocationOnScreen(loc)
         c.save()
         c.translate(-loc[0].toFloat(), -loc[1].toFloat())
+
+        // Lapis 1: kabut lembut di sekeliling tiap teks.
         for (d in items) {
-            bgPaint.color = d.bg
-            c.drawRoundRect(d.rect, radius, radius, bgPaint)
+            halo.color = d.bg
+            rr.set(d.rect)
+            rr.inset(-blur * 0.8f, -blur * 0.8f)
+            c.drawRoundRect(rr, blur, blur, halo)
+        }
+        // Lapis 2: latar penutup teks asli, lalu terjemahan di atasnya.
+        for (d in items) {
+            solid.color = d.bg
+            c.drawRoundRect(d.rect, 6f * dens, 6f * dens, solid)
             c.save()
             c.translate(
                 d.rect.left + d.pad,
@@ -126,6 +151,7 @@ class ResultView(
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (!touchable) return false
         if (e.actionMasked == MotionEvent.ACTION_UP) onClose()
         return true
     }
