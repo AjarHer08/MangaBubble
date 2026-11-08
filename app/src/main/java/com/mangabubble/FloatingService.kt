@@ -12,6 +12,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -52,9 +53,12 @@ class FloatingService : Service() {
         const val ACTION_STOP = "com.mangabubble.STOP"
         private const val CHANNEL = "mb"
         private const val NOTIF_ID = 1
-        private const val THRESH = 4f          // selisih rata-rata sidik jari layar yang dianggap "berubah"
+        private const val THRESH = 5f          // selisih rata-rata sidik jari layar yang dianggap "berubah"
         private const val STABLE_MS = 900L     // layar harus diam sekian ms sebelum terjemah otomatis
         private const val TICK_MS = 500L
+        private const val COOLDOWN_MS = 2500L  // jeda minimum antar terjemahan otomatis
+        private const val GX = 24              // kisi sidik jari
+        private const val GY = 48
     }
 
     private lateinit var wm: WindowManager
@@ -88,6 +92,14 @@ class FloatingService : Service() {
     private var suppressUntil = 0L
     private var translatedStable = false
     private var paused = false
+    private var changeBlip = false
+    private var lastTranslateEnd = 0L
+    private var bubbleLp: WindowManager.LayoutParams? = null
+
+    // Hasil terjemahan terakhir. Dipakai ulang bila layar sama, supaya tidak memanggil AI lagi.
+    private var cachedItems: List<Fitter.Drawn>? = null
+    private var cachedFp: ByteArray? = null
+    private var maskRects: List<RectF> = emptyList()
     private val ticker = object : Runnable {
         override fun run() {
             tick()
@@ -224,6 +236,9 @@ class FloatingService : Service() {
             reader = nr
             capW = w; capH = h
             lastFp = null
+            cachedItems = null
+            cachedFp = null
+            maskRects = emptyList()
             translatedStable = false
             lastChangeAt = SystemClock.uptimeMillis()
         } catch (e: Exception) {
@@ -253,12 +268,12 @@ class FloatingService : Service() {
         val rs = plane.rowStride
         val w = img.width
         val h = img.height
-        val gx = 24
-        val gy = 48
+        val gx = GX
+        val gy = GY
         val out = ByteArray(gx * gy)
         for (j in 0 until gy) for (i in 0 until gx) {
-            val x = i * w / gx + w / (2 * gx)
-            val y = j * h / gy + h / (2 * gy)
+            val x = sx(i, w)
+            val y = sy(j, h)
             val o = y * rs + x * ps
             val r = buf.get(o).toInt() and 0xFF
             val g = buf.get(o + 1).toInt() and 0xFF
@@ -268,11 +283,35 @@ class FloatingService : Service() {
         return out
     }
 
+    // Kisi sampel hanya mencakup 8%-92% tinggi layar, jadi status bar, jam, kecepatan internet,
+    // dan toolbar browser tidak ikut dihitung.
+    private fun sx(i: Int, w: Int) = i * w / GX + w / (2 * GX)
+
+    private fun sy(j: Int, h: Int): Int {
+        val span = (h * 0.84f).toInt()
+        return (h * 0.08f).toInt() + j * span / GY + span / (2 * GY)
+    }
+
+    /** Titik yang tertutup tambalan terjemahan atau bubble diabaikan, supaya overlay kita sendiri tidak dianggap perubahan halaman. */
+    private fun masked(x: Float, y: Float): Boolean {
+        for (r in maskRects) if (r.contains(x, y)) return true
+        val lp = bubbleLp ?: return false
+        val m = 12 * resources.displayMetrics.density
+        val s = 56 * resources.displayMetrics.density
+        return x >= lp.x - m && x <= lp.x + s + m && y >= lp.y - m && y <= lp.y + s + m
+    }
+
     private fun diff(a: ByteArray, b: ByteArray): Float {
-        if (a.size != b.size) return 255f
+        if (a.size != b.size || capW == 0) return 255f
         var s = 0L
-        for (i in a.indices) s += abs((a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF))
-        return s.toFloat() / a.size
+        var n = 0
+        for (j in 0 until GY) for (i in 0 until GX) {
+            if (masked(sx(i, capW).toFloat(), sy(j, capH).toFloat())) continue
+            val k = j * GX + i
+            s += abs((a[k].toInt() and 0xFF) - (b[k].toInt() and 0xFF))
+            n++
+        }
+        return if (n == 0) 0f else s.toFloat() / n
     }
 
     private fun tick() {
@@ -296,20 +335,34 @@ class FloatingService : Service() {
         lastFp = fp
         if (now < suppressUntil || prev == null) return
 
-        if (diff(prev, fp) > THRESH) {
+        val d = diff(prev, fp)
+        // Perubahan besar (ganti halaman) langsung dihitung; perubahan sedang harus terjadi dua kali berturut-turut.
+        val moved = d > 20f || (d > THRESH && changeBlip)
+        changeBlip = d > THRESH
+        if (moved) {
             // Layar bergerak (scroll / halaman atau chapter baru): buang terjemahan lama.
             lastChangeAt = now
             translatedStable = false
             paused = false
             if (result != null) {
                 removeResultView()
-                suppressUntil = now + 400 // abaikan perubahan akibat overlay yang kita lepas sendiri
+                suppressUntil = now + 300
             }
             return
         }
-        if (!translatedStable && !paused && now - lastChangeAt >= STABLE_MS) {
+        if (d > THRESH) return // mungkin hanya kedip sesaat, tunggu tick berikutnya
+
+        if (!translatedStable && !paused &&
+            now - lastChangeAt >= STABLE_MS && now - lastTranslateEnd >= COOLDOWN_MS
+        ) {
             translatedStable = true
-            startTranslate()
+            val ci = cachedItems
+            val cf = cachedFp
+            if (ci != null && cf != null && diff(cf, fp) <= THRESH) {
+                showResult(ci) // layar sama dengan yang sudah diterjemahkan: pasang ulang tanpa memanggil AI
+            } else {
+                startTranslate()
+            }
         }
     }
 
@@ -331,6 +384,7 @@ class FloatingService : Service() {
             x = (8 * d).toInt()
             y = capH / 3
         }
+        bubbleLp = lp
         val v = BubbleView(this, wm, lp, onTap = { onBubbleTap() }, onLong = { stopSelf() })
         wm.addView(v, lp)
         bubble = v
@@ -411,12 +465,21 @@ class FloatingService : Service() {
                 }
             }
 
-            val found = lines
+            // Buang teks di status bar, bar navigasi, dan alamat situs: itu bukan isi komik.
+            val topBar = sysBar("status_bar_height")
+            val botBar = sysBar("navigation_bar_height")
+            val urlLike = Regex("https?:|\\w\\.(org|com|net|io|me)/")
+            val found = lines.filter { l ->
+                val cy = l.r.centerY()
+                cy > topBar && cy < sh - botBar && !urlLike.containsMatchIn(l.text)
+            }
             var pairs: List<Pair<Rect, String>>? = null
             if (apiKey.isNotEmpty() && found.isNotEmpty()) {
                 try {
-                    pairs = Claude.translate(apiKey, model, bmp, found, src, tgt).map { g ->
-                        Ocr.union(g.ids.map { found[it] }) to g.text
+                    pairs = Claude.translate(apiKey, model, bmp, found, src, tgt).mapNotNull { g ->
+                        val ls = g.ids.map { found[it] }
+                        // Teks yang hasilnya sama dengan aslinya tidak perlu ditimpa.
+                        if (same(Ocr.join(ls, src), g.text)) null else Ocr.union(ls) to g.text
                     }
                 } catch (e: Exception) {
                     note = "AI gagal (${e.message}), memakai terjemahan bawaan"
@@ -457,7 +520,7 @@ class FloatingService : Service() {
             val joined = Ocr.join(g, src)
             if (joined.count { it.isLetterOrDigit() } < 2) continue
             val t = Tasks.await(tr.translate(joined)).trim()
-            if (t.isNotEmpty()) out.add(Ocr.union(g) to t)
+            if (t.isNotEmpty() && !same(joined, t)) out.add(Ocr.union(g) to t)
         }
         return out
     }
@@ -488,6 +551,12 @@ class FloatingService : Service() {
             suppressUntil = 0
             return
         }
+        // Simpan hasil dan area tambalan. Halaman yang sama tidak akan diterjemahkan dua kali.
+        val inf = 16 * resources.displayMetrics.density
+        maskRects = items.map { RectF(it.rect).apply { inset(-inf, -inf) } }
+        cachedItems = items
+        cachedFp = captureFp
+        lastTranslateEnd = SystemClock.uptimeMillis()
         if (items.isEmpty()) {
             if (!auto) toast("Teks tidak ditemukan. Perbesar halaman atau cek jenis komik.")
             finishBusy()
@@ -536,6 +605,15 @@ class FloatingService : Service() {
         }
         busy = false
         suppressUntil = SystemClock.uptimeMillis() + 600
+        lastTranslateEnd = SystemClock.uptimeMillis()
+    }
+
+    private fun same(a: String, b: String): Boolean =
+        a.lowercase().filter { it.isLetterOrDigit() } == b.lowercase().filter { it.isLetterOrDigit() }
+
+    private fun sysBar(name: String): Int {
+        val id = resources.getIdentifier(name, "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else 0
     }
 
     private fun toast(msg: String) {
@@ -550,6 +628,9 @@ class FloatingService : Service() {
         busy = false
         lastFp = null
         captureFp = null
+        cachedItems = null
+        cachedFp = null
+        maskRects = emptyList()
         bubble?.let { runCatching { wm.removeView(it) } }
         bubble = null
         runCatching { display?.release() }

@@ -65,7 +65,8 @@ object Claude {
             "2. Fix obvious OCR mistakes by looking at the image (e.g. a misread letter), and keep character names unchanged.\n" +
             "3. Translate each group into natural, fluent ${langName(tgt)}, keeping tone, emotion and honorifics. " +
             "For Indonesian use natural, casual comic-translation style, not literal word-for-word.\n" +
-            "4. Leave out sound effects (onomatopoeia such as Ding, Bam, ドン), watermarks, website or app interface, and page numbers.\n\n" +
+            "4. Leave out sound effects (onomatopoeia such as Ding, Bam, ドン), watermarks, website or app interface " +
+            "(status bar, clock, battery, URL, browser toolbar), page numbers, and any text that needs no translation.\n\n" +
             "Reply with ONLY this JSON and nothing else:\n" +
             "{\"items\":[{\"ids\":[0,1],\"text\":\"translated text\"}]}"
 
